@@ -227,24 +227,27 @@ quadVertexBuffer.unmap();////  "quad" ->coordonnées des coins
 GlobalsGPU.setGlobals({ctx:context,device,presentationFormat})
 
 let data=Data.fromBuffer(particlesBuffer)
+let randomSeeds=new Data("array<f32>","storage",N*2*4,{flags:GPUBufferUsage.COPY_DST})///deux f32 par particle
+let randomArray=new Float32Array(N*2)
+for(let i=0;i<N*2;i++){randomArray[i]=Math.random()*2-1}
+randomSeeds.write(randomArray)
+
 let init=new Action(`
 #var<storage, read_write> data : array<Particle>;
-fn rand(i:u32)->vec2f{
-	let x=f32(i);
-	let a=sin(x*771.5-x*x/10.0)*0.8-0.2*sin(x*1000.5-x*x*x/1.0);
-	let b=cos(x*33801.0+x*a)*(f32((i+31)%91)/91*2 - 1.0)*0.8+sin(x*7.0+42.0)*0.2;
-	return vec2f(a+b, a-b)/2.0;//entre -1 et 1
+#var<storage, read> random : array<f32>;
+fn rerand(x:f32)->f32{//-1<x<1
+	return -cos(x*3.1415);
 }
 @compute @workgroup_size(64) fn cs($ID){///ATTENTION A PAS OUT_OF_BOUNDS
 	let i=id.x;
-	let r=rand(i);
-	data[i].pos=vec2f(r.x*${W/2}, r.y*${H/2});
+	let r=vec2f(random[i*2],random[i*2+1]);
+	data[i].pos=vec2f(r.x*${W/2}*0.8, r.y*${H/2}*0.8);
 	data[i].last=data[i].pos;
 	data[i].newpos=data[i].pos;
-	data[i].col=vec4f(0.25*(2.0-r.x-r.y),0.5+r.x/2.0,(1.0+r.y)/2,1);
+	data[i].col=vec4f((-r.x+r.y+2)/4+0.6,(1+sin((r.x+1)*3.14))/2,(1.0+sin((r.y+1)*3.14))/2,1);
 }
 `)
-init.fixBindGroup({data:data});
+init.fixBindGroup({data:data,random:randomSeeds});
 
 GlobalsGPU.startPass()
 init.apply(-1,Math.ceil(N/64))
@@ -388,7 +391,7 @@ let exchangePosAndNewPos=new Action(`/////interaction entre particules
 ${collisionsBords}
 fn getForce(pos:vec2f) -> vec2f{
 	let d2=dot(pos-obst.pos,pos-obst.pos);
-	return vec2f(0,-g)+select(vec2f(0),vec2f(2.2,0.2),pos.y<-300 && pos.x<100.0 && pos.x>-dim.x/2.0+100) + select(vec2f(0.0,0.0),(pos-obst.pos)/(d2+200.0)*1500.0,d2<100*100);
+	return vec2f(0,-g)+select(vec2f(0),vec2f(2.2,0.2),pos.y<-300 && pos.x<100.0 && pos.x>-dim.x/2.0+100) + select(vec2f(0.0,0.0),(pos-obst.pos)/(d2+100.0)*2000.0,d2<100*100);
 }
 @compute @workgroup_size(64) fn cs($ID){
 	let i=id.x;
@@ -453,7 +456,7 @@ function fps(){
 all()
 
 
-canvas.addEventListener("mousemove", (e)=>{
+document.addEventListener("mousemove", (e)=>{
 	let r=canvas.getBoundingClientRect()
 	let x = e.clientX - r.left;
 	let y = e.clientY - r.top;
