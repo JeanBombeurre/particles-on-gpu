@@ -1,0 +1,465 @@
+<html>
+<body style="background-color:lightgrey;">
+<script src="NewWebGPUlib.js"></script>
+<center><div id="inu0"></div><canvas id="canvas" width=1024 height=700></canvas><div id="inu1"></div></center>
+<script>
+///copie générale de https://webgpu.github.io/webgpu-samples/?sample=particles#main.ts
+//OFFSET COMPUTER     https://webgpufundamentals.org/webgpu/lessons/resources/wgsl-offset-computer.html
+
+let H=canvas.height, W=canvas.width
+let N=64*150// NOMBRE PARTICULES, mieux si multiple de 64
+let R=3.1//RAYON
+const RMAX=R/////utilisé dans la grille, rayon de la grille.
+let dt=1/30;
+const G=0.5
+const cote=RMAX*3.2 // coté de la grille, min=2*R
+const dimGrille={w:Math.ceil(W/cote), h:Math.ceil(H/cote)}
+console.log("dim grille : ",dimGrille)
+const Ncells = dimGrille.w*dimGrille.h
+
+let updateObst;
+let structsText=`
+struct collisionsUniform{
+	pos : vec2f,
+	r:f32,
+}
+struct Particle{//no padding
+	pos:vec2f, 
+	last: vec2f,//last position... 
+	col:vec4f,
+	newpos:vec2f,
+	kissing : i32,////kissing number
+	id : u32,//utilisé pour la grille, id local de cellule
+}
+const N:u32=${N};
+const r:f32=${R};
+const dim=vec2f(${W},${H});
+const dt:f32=${dt};
+const g:f32=${G};
+const cote:f32=${cote};
+const dimGrille= vec2i(${dimGrille.w}, ${dimGrille.h});
+const Ncells:u32=${Ncells};`
+
+Action.defines(structsText)
+////////////////////////////////obstacles cercles
+/*let obst=[{x:-200,y:-200,r:60}]
+let obstaclesBonus=""
+let ninu=42
+for(let {x:x,y:y,r:r} of obst){
+	let centre=`vec2f(${x},${y})`
+	obstaclesBonus+=`let d${++ninu} = dot(rep-${centre}, rep-${centre});
+	if(d${ninu}<=${(r+R)*(r+R)}){rep=${centre}+(rep-${centre})/sqrt(d${ninu})*${R+r};}
+	`
+}*/
+
+let collisionsBords=`
+const R=300.0;
+const centre=vec2f(dim.x/2-R,-dim.y/2+R);//centre du cercle contrainte
+const R2=100.0;
+const centre2=vec2f(dim.x/2-R2,dim.y/2-R2);//centre du cercle contrainte
+const R4=30.0;
+const centre4=vec2f(-dim.x/2+R4,-dim.y/2+R4);//centre du cercle contrainte
+fn collisionsBords(pos:vec2f) ->vec2f{
+	var rep=pos;
+	///cercles
+	//let dObst=dot(rep-obst.pos,rep-obst.pos);
+	//if(dObst< (obst.r+r)*(obst.r+r)){rep=obst.pos+(rep-obst.pos)/sqrt(dObst)*(obst.r+r);}
+	let d2=dot(rep-centre,rep-centre);
+	let d22=dot(rep-centre2,rep-centre2);
+	if(d2> (R-r)*(R-r) && rep.x>=centre.x && rep.y<=centre.y){rep=centre+(rep-centre)/sqrt(d2)*(R-r);}
+	if(d22> (R2-r)*(R2-r) && rep.x>=centre2.x && rep.y>=centre2.y){rep=centre2+(rep-centre2)/sqrt(d22)*(R2-r);}
+	let d4=dot(rep-centre4,rep-centre4);
+	if(d4> (R4-r)*(R4-r) && rep.x<centre4.x && rep.y<centre4.y){rep=centre4+(rep-centre4)/sqrt(d4)*(R4-r);}
+	
+	if(rep.y-r < -dim.y/2.0){
+		rep.y=-dim.y/2.0+r;
+	}
+	if(rep.y+r > dim.y/2){
+		rep.y=dim.y/2-r;
+	}
+	if(rep.x+r>dim.x/2){ rep.x=dim.x/2-r;}
+	if(rep.x-r<-dim.x/2){ rep.x=-dim.x/2+r;}
+	
+	return rep;
+}`
+let shader=`/////////////////////shader de rendu
+const dim=vec2f(${W},${H});
+const r:f32=${R};
+struct VertexInput{
+	@location(0) pos : vec2f, //est en fait le last de la particule
+	@location(1) quad_pos : vec2f, ///position coin triangle, dans {-1,1}
+	@location(2) col : vec4f,
+}
+struct VertexOutput{
+	@builtin(position) pos : vec4f,
+	@location(1) col:vec4f,
+	@location(2) quad_pos:vec2f
+}
+@vertex fn vs(v: VertexInput) -> VertexOutput{
+	var out : VertexOutput;
+	let center=2*v.pos/dim;///dans le clip space tkt
+	let coin=2*v.quad_pos/dim * r;
+	out.pos =vec4f(center+coin, 0,1);
+	out.col=v.col;
+	out.quad_pos=v.quad_pos;
+	return out;
+}
+@fragment fn fs(f : VertexOutput) -> @location(0) vec4f{
+	return vec4f(f.col.xyz, select(f.col.a,0.0, dot(f.quad_pos,f.quad_pos)>1));////
+}`
+
+
+async function all(){
+let canvas=document.getElementById("canvas")
+let context=canvas.getContext("webgpu")
+
+let go=0
+let time=0;
+document.onkeydown=e=>{
+	if(e.key=="x"){
+		go=!go
+		document.getElementById("inu0").innerHTML=go?"":"X POUR CONTINUER"
+		if(go)main()
+	}else if(e.key=="w") main()
+}
+
+
+const particleByteSize= 48 /// pos:vec2f, last:vec2f, col:vec4f
+const adapter = await navigator.gpu.requestAdapter();
+const device = await adapter.requestDevice();
+
+const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+
+context.configure({device,format: presentationFormat,alphaMode: 'premultiplied'});
+
+const particlesBuffer = device.createBuffer({
+label:"particlesBuffer",
+  size: N * particleByteSize,
+  usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE,
+});
+
+const renderPipeline = device.createRenderPipeline({
+  layout: 'auto',
+  vertex: {
+    module: device.createShaderModule({code: shader}),
+    buffers: [
+      {
+        // instanced particles buffer
+        arrayStride: particleByteSize,
+        stepMode: 'instance',
+        attributes: [
+          {
+            // position
+            shaderLocation: 0,
+            offset: 8,//particle <last> offset
+            format: 'float32x2',
+          },
+          {
+            // color
+            shaderLocation: 2,
+            offset: 16,//particle color offset
+            format: 'float32x4',
+          },
+        ],
+      },
+      {
+        // quad vertex buffer
+        arrayStride: 2 * 4, // vec2f
+        stepMode: 'vertex',
+        attributes: [
+          {
+            // vertex positions
+            shaderLocation: 1,
+            offset: 0,//// ? ok lol
+            format: 'float32x2',
+          },
+        ],
+      },
+    ],
+  },
+  fragment: {
+    module: device.createShaderModule({
+      code: shader,
+    }),
+    targets: [
+      {
+        format: presentationFormat,
+        blend: {//// wtf ok
+          color: {
+            srcFactor: 'src-alpha',
+            dstFactor: 'one',
+            operation: 'add',
+          },
+          alpha: {
+            srcFactor: 'zero',
+            dstFactor: 'one',
+            operation: 'add',
+          },
+        },
+      },
+    ],
+  },
+  primitive: {
+    topology: 'triangle-list',
+  },
+});
+const renderPassDescriptor = { /// ?? ":GPURenderPassDescriptor"
+  colorAttachments: [{
+      view: undefined, // Assigned later
+      clearValue: [0, 0, 0, 1],
+      loadOp: 'clear',
+      storeOp: 'store',
+    },
+  ]
+};
+const quadVertexBuffer = device.createBuffer({
+	label:"quadVertexBuffer",
+  size: 6 * 2 * 4, // 6x vec2f
+  usage: GPUBufferUsage.VERTEX,
+  mappedAtCreation: true,
+});
+const vertexData = [-1.0, -1.0, +1.0, -1.0, -1.0, +1.0, -1.0, +1.0, +1.0, -1.0, +1.0, +1.0,];
+new Float32Array(quadVertexBuffer.getMappedRange()).set(vertexData);
+quadVertexBuffer.unmap();////  "quad" ->coordonnées des coins
+
+////////////////////////////////////////////////////////////////MOI MNT///////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////
+GlobalsGPU.setGlobals({ctx:context,device,presentationFormat})
+
+let data=Data.fromBuffer(particlesBuffer)
+let init=new Action(`
+#var<storage, read_write> data : array<Particle>;
+fn rand(i:u32)->vec2f{
+	let x=f32(i);
+	let a=sin(x*771.5-x*x/10.0)*0.8-0.2*sin(x*1000.5-x*x*x/1.0);
+	let b=cos(x*33801.0+x*a)*(f32((i+31)%91)/91*2 - 1.0)*0.8+sin(x*7.0+42.0)*0.2;
+	return vec2f(a+b, a-b)/2.0;//entre -1 et 1
+}
+@compute @workgroup_size(64) fn cs($ID){///ATTENTION A PAS OUT_OF_BOUNDS
+	let i=id.x;
+	let r=rand(i);
+	data[i].pos=vec2f(r.x*${W/2}, r.y*${H/2});
+	data[i].last=data[i].pos;
+	data[i].newpos=data[i].pos;
+	data[i].col=vec4f(0.25*(2.0-r.x-r.y),0.5+r.x/2.0,(1.0+r.y)/2,1);
+}
+`)
+init.fixBindGroup({data:data});
+
+GlobalsGPU.startPass()
+init.apply(-1,Math.ceil(N/64))
+GlobalsGPU.endPass()
+
+//////////////GRILLE////////////////////////////////////////////////////////////////////////
+let stepNumber=Math.ceil(Math.log2(Ncells))//////////////////VERIFIER
+let p_indices=new Data("array<u32>", "storage", N*4);
+
+
+let offsetBuffers = []
+for(let i=0;2**i<Ncells;i++) offsetBuffers.push(new Data("u32","uniform",4)); // un u32.
+for(let i=0;2**i<Ncells;i++) offsetBuffers[i].write(u32([2**i]))
+
+let gridCount=new Data("void","storage",Ncells*4);///contient les tailles cde cellules, void car atomics...
+let cellIndex = [new Data("array<u32>","storage", Ncells*4),new Data("array<u32>","storage", Ncells*4)]//ping pong
+
+let initGrid=new Action(`//met gridCount à 0,ATTENTION EXECUTE MOINS QUE LES AUTRES
+# var<storage, read_write> gridCount : array<u32>;
+@compute @workgroup_size(64) fn cs($ID) {gridCount[id.x]=0;}`)
+initGrid.fixBindGroup({gridCount})
+
+let getcell=`fn getcell(p:vec2f) -> i32{//optimisable?
+	return i32((p.x+dim.x/2.0)/cote)+dimGrille.x*i32((p.y+dim.y/2.0)/cote);
+}`
+
+let countBallsPerCell=new Action(`///remplis gridCount + remplis les localId
+# var<storage, read_write> data : array<Particle>;
+# var<storage, read_write> gridCount : array<atomic<u32>>;
+${getcell}
+@compute @workgroup_size(64) fn cs($ID) {
+	let i=id.x;
+	if(i<N){
+		let cell=getcell(data[i].pos);
+		data[i].id=atomicAdd(&gridCount[cell],1u);
+	}
+}`)
+countBallsPerCell.fixBindGroup({data, gridCount});
+
+let prefixSumStep=new Action(`//envoie dans cellindex (ping pong)
+#var<uniform> offset : u32; //////////////////// de combien on decale (2**i)
+#var<storage, read> input : array<u32>;
+#var<storage, read_write> output : array<u32>;
+@compute @workgroup_size(64) fn cs($ID) {///render sur cellIndex pour la premiere fois
+	if(id.x<N){
+		output[id.x]=input[id.x]+select(input[id.x-offset],0,id.x<offset);
+	}
+}`)
+////make ping pong bindings
+let bindings=[]
+let target = 0//// entre 0 et 1 pingpong cellIndex
+for(let i=0;2**i<Ncells;i++){
+	bindings.push(prefixSumStep.makeBindGroup({offset: offsetBuffers[i], input:(i==0)?gridCount:cellIndex[1-target],output:cellIndex[target]}))
+	
+	target=1-target
+}
+cellIndexRealValue=1-target /////buffer de confiance
+
+let ecrisBalles= new Action(`
+#var<storage, read> gridCount : array<u32>;
+#var<storage, read> data : array<Particle>;
+#var<storage, read> cellIndex : array<u32>;
+#var<storage, read_write> p_indices : array<u32>;/////permutation de tous les indices pour fit les cases
+${getcell}
+@compute @workgroup_size(64) fn cs($ID) {///render sur cellIndex pour la premiere fois
+	if(id.x<N){
+		let curcell=getcell(data[id.x].pos);
+		let index=data[id.x].id + cellIndex[curcell]-gridCount[curcell];
+		p_indices[index]=id.x;
+	}
+}`)
+ecrisBalles.fixBindGroup({gridCount, data, cellIndex:cellIndex[cellIndexRealValue], p_indices})
+
+function actugrille(pass){////init, compte, prefix sum
+	initGrid.apply(-1,Math.ceil(Ncells / 64))
+	countBallsPerCell.apply(-1,Math.ceil(N / 64))
+	GlobalsGPU.pass.setPipeline(prefixSumStep.pipeline)///POUR EVITER DE RE SET PIPELINE 50 FOIS, ON FAIT A LA MAIN.
+
+	for(let i=0;i<bindings.length;i++){
+		GlobalsGPU.pass.setBindGroup(0,bindings[i])
+		GlobalsGPU.pass.dispatchWorkgroups(Math.ceil(Ncells / 64))
+	}
+	ecrisBalles.apply(-1,Math.ceil(N/64))
+}
+
+////////////////////////////////////////////////MOTEUR/////////////////////////////////////
+let obst=new Data("void","uniform", 16)
+obst.write(f32([-1000,-1000,60]))///rayon =60 par defaut
+updateObst = (x,y) => obst.write(f32([x,y]))
+
+let calcNewPos=new Action(`/////interaction entre particules
+#var<storage, read_write> data : array<Particle>;
+#var<storage, read> gridCount : array<u32>;
+#var<storage, read> cellIndex : array<u32>;
+#var<storage, read> p_indices : array<u32>;
+
+${collisionsBords}
+${getcell}
+fn considere(pos:vec2f, i:u32, j:u32) -> vec2f{//i : moi	
+	let p=data[j].pos;
+	let d2=dot(p-pos, p-pos);////OPTIMISABLE
+	if(d2<${4*R*R}){
+		let d=sqrt(d2);
+		let u=(p-pos)/d;
+		data[i].kissing++;
+		return 0.5*u*(d-2.0*r);///voir signe
+	}
+	return vec2f(0.0,0.0);
+}
+fn getnewpos(pos:vec2f, i:u32) -> vec2f {//ITERE+CALCULE COLLISIONS
+	var rep=pos;
+
+	var cell0:u32=(u32(getcell(pos))+ (Ncells-u32(dimGrille.x) - 1u) )%Ncells; //BOTTOM LEFT CELL
+	for(var k:u32 = 0; k< gridCount[cell0]+gridCount[(cell0+1)%Ncells]+gridCount[(cell0+2)%Ncells];k++){
+		let j=p_indices[(cellIndex[cell0]-gridCount[cell0]+k)%N];
+		rep+=considere(pos,i,j);
+	}
+	cell0=(cell0+u32(dimGrille.x))%Ncells;
+	for(var k:u32 = 0; k< gridCount[cell0]+gridCount[(cell0+1)%Ncells]+gridCount[(cell0+2)%Ncells];k++){
+		let j=p_indices[(cellIndex[cell0]-gridCount[cell0]+k)%N];
+		if(j!=i){rep+=considere(pos,i,j);}
+	}
+	cell0=(cell0+u32(dimGrille.x))%Ncells;
+	for(var k:u32 = 0; k< gridCount[cell0]+gridCount[(cell0+1)%Ncells]+gridCount[(cell0+2)%Ncells];k++){
+		let j=p_indices[(cellIndex[cell0]-gridCount[cell0]+k)%N];
+		rep+=considere(pos,i,j);
+	}
+	return collisionsBords(rep);
+}
+@compute @workgroup_size(64) fn cs($ID){
+	let i=id.x;
+	if(i<N){
+		data[i].newpos=getnewpos(data[i].pos,i);
+	}
+}`);
+calcNewPos.fixBindGroup({data, gridCount, cellIndex : cellIndex[cellIndexRealValue], p_indices});
+
+let exchangePosAndNewPos=new Action(`/////interaction entre particules
+#var<storage, read_write> data : array<Particle>;
+#var<uniform> obst: collisionsUniform;
+${collisionsBords}
+fn getForce(pos:vec2f) -> vec2f{
+	let d2=dot(pos-obst.pos,pos-obst.pos);
+	return vec2f(0,-g)+select(vec2f(0),vec2f(2.2,0.2),pos.y<-300 && pos.x<100.0 && pos.x>-dim.x/2.0+100) + select(vec2f(0.0,0.0),(pos-obst.pos)/(d2+200.0)*1500.0,d2<100*100);
+}
+@compute @workgroup_size(64) fn cs($ID){
+	let i=id.x;
+	if(i<N){
+		var p = data[i];
+		//correction par newpos
+		p.pos=select(p.pos+(p.newpos-p.pos)/f32(p.kissing),p.newpos,p.kissing==0);
+
+		let inu=p.pos;
+		p.pos = 2 * p.pos - p.last; ////VERLET
+		p.last=inu;
+		p.pos+=getForce(p.pos)*dt*dt;
+		p.pos=collisionsBords(p.pos);
+		p.newpos=p.pos;
+		p.kissing=0;
+		data[i]=p;
+	}
+}`);
+exchangePosAndNewPos.fixBindGroup({data,obst});
+
+function main(){
+fpsc++
+	renderPassDescriptor.colorAttachments[0].view = context.getCurrentTexture().createView();/// aucune idée lol
+	const commandEncoder = device.createCommandEncoder();
+	{//compute
+		const passEncoder = commandEncoder.beginComputePass();
+		GlobalsGPU.startPass(passEncoder)
+		for(let t=0;t<Math.round(1/dt);t++){
+			actugrille()			
+			calcNewPos.apply(-1,Math.ceil(N / 64))///////////////OPTI : change pas de Bg
+			exchangePosAndNewPos.apply(-1,Math.ceil(N / 64))
+			
+		}
+		GlobalsGPU.endPass()
+		passEncoder.end();
+	}
+	{///render
+		const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
+		passEncoder.setPipeline(renderPipeline);
+		passEncoder.setVertexBuffer(0, particlesBuffer);
+		passEncoder.setVertexBuffer(1, quadVertexBuffer);
+		passEncoder.draw(6, N,  0, 0);
+		passEncoder.end();
+	}
+
+	device.queue.submit([commandEncoder.finish()]);
+
+	if(!go) return
+	time++;
+	window.requestAnimationFrame(main)
+}
+main()
+}
+let fpsc=0;
+fps()
+function fps(){
+	document.getElementById("inu1").innerHTML=N+" particules. fps : "+fpsc*2
+	fpsc=0;
+	setTimeout(fps,500)
+}
+
+all()
+
+
+canvas.addEventListener("mousemove", (e)=>{
+	let r=canvas.getBoundingClientRect()
+	let x = e.clientX - r.left;
+	let y = e.clientY - r.top;
+	updateObst(x-W/2,H/2-y);
+}); 
+//todo : add cell dans Particle
+</script>
+</body>
+</html>
