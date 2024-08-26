@@ -292,7 +292,7 @@ let prefixSumStep=new Action(`//envoie dans cellindex (ping pong)
 #var<storage, read> input : array<u32>;
 #var<storage, read_write> output : array<u32>;
 @compute @workgroup_size(64) fn cs($ID) {///render sur cellIndex pour la premiere fois
-	if(id.x<N){
+	if(id.x<Ncells){
 		output[id.x]=input[id.x]+select(input[id.x-offset],0,id.x<offset);
 	}
 }`)
