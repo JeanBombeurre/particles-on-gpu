@@ -103,7 +103,7 @@ class Action{///////////////NODE DE CALCUL.
 		})
 	}
 	static defines(str){//déclaration ajoutée à chaque début de shader
-		Action.defines=str
+		Action.defs=str
 	}
 	preprocess(){///ajoute fonctions utiles au debut, et surtout repère les arguments, leurs types
 		//replaces
@@ -111,7 +111,7 @@ class Action{///////////////NODE DE CALCUL.
 		this.code=this.str.replace("$CANVAS", "texture_storage_2d<"+GlobalsGPU.presentationFormat+",write>");
 		this.code=this.code.replaceAll("#", (...a) => `@group(0) @binding(${inu++}) `)
 		this.code=this.code.replaceAll("$ID","@builtin(global_invocation_id) id : vec3u")
-		this.code=Action.defines+'\n'+this.code
+		this.code=Action.defs?Action.defs+'\n'+this.code:this.code
 		
 		this.bindingList=[]//liste d'indices
 		let args={}
@@ -137,7 +137,8 @@ class Action{///////////////NODE DE CALCUL.
 		let entries=[]
 		for(let i of this.bindingList){
 			let data=args[this.argsType[i].name]
-			if(!data) throw "argument missing "+this.argsType[i].name+" in "+this.code
+
+			if(!data) throw "argument missing :<"+this.argsType[i].name+"> in shader : \n\n\n"+this.code
 			if(data.type!=this.argsType[i].type && data.type!="CANVAS" && data.type!="void") throw "types pas coherents : "+data.type+" dans "+this.argsType[i].type
 			entries.push({binding:i, resource:data.getResource()})	
 		}
@@ -189,4 +190,31 @@ async function read(buffer,type=f32){//lit array<u32>
 		console.log(inu);
 		
 	}) 
+}
+
+async function setupWebGPU(ctx){
+	const adapter = await navigator.gpu?.requestAdapter();
+	const hasBGRA8unormStorage = adapter.features.has('bgra8unorm-storage');
+	const device = await adapter?.requestDevice({///POUR RENDER SUR CANVAS
+		requiredFeatures: hasBGRA8unormStorage
+			? ['bgra8unorm-storage']
+			: [],
+	});
+	GlobalsGPU.device=device
+	GlobalsGPU.ctx=ctx
+	
+	if (!device) {
+		fail('need a browser that supports WebGPU');
+		return;
+	}
+	const presentationFormat = hasBGRA8unormStorage
+		? navigator.gpu.getPreferredCanvasFormat()
+		: 'rgba8unorm';
+	ctx.configure({
+		device,
+		format: presentationFormat,
+		usage: GPUTextureUsage.TEXTURE_BINDING |
+			GPUTextureUsage.STORAGE_BINDING,
+	});
+	GlobalsGPU.presentationFormat=presentationFormat
 }
