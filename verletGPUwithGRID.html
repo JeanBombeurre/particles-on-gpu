@@ -10,8 +10,8 @@ let H=canvas.height, W=canvas.width
 let N=64*150// NOMBRE PARTICULES, mieux si multiple de 64
 let R=3.1//RAYON
 const RMAX=R/////utilisé dans la grille, rayon de la grille.
-let dt=1/30;
-const G=0.5
+let dt=1/27;
+const G=0.32
 const cote=RMAX*3.2 // coté de la grille, min=2*R
 const dimGrille={w:Math.ceil(W/cote), h:Math.ceil(H/cote)}
 console.log("dim grille : ",dimGrille)
@@ -29,7 +29,7 @@ struct Particle{//no padding
 	col:vec4f,
 	newpos:vec2f,
 	kissing : i32,////kissing number
-	id : u32,//utilisé pour la grille, id local de cellule
+	id : u32,//utilisé pour la grille : =cellNumber+Ncells * idLocal
 }
 const N:u32=${N};
 const r:f32=${R};
@@ -37,7 +37,7 @@ const dim=vec2f(${W},${H});
 const dt:f32=${dt};
 const g:f32=${G};
 const cote:f32=${cote};
-const dimGrille= vec2i(${dimGrille.w}, ${dimGrille.h});
+const dimGrille= vec2u(${dimGrille.w}, ${dimGrille.h});
 const Ncells:u32=${Ncells};`
 
 Action.defines(structsText)
@@ -61,9 +61,6 @@ const R4=30.0;
 const centre4=vec2f(-dim.x/2+R4,-dim.y/2+R4);//centre du cercle contrainte
 fn collisionsBords(pos:vec2f) ->vec2f{
 	var rep=pos;
-	///cercles
-	//let dObst=dot(rep-obst.pos,rep-obst.pos);
-	//if(dObst< (obst.r+r)*(obst.r+r)){rep=obst.pos+(rep-obst.pos)/sqrt(dObst)*(obst.r+r);}
 	let d2=dot(rep-centre,rep-centre);
 	let d22=dot(rep-centre2,rep-centre2);
 	if(d2> (R-r)*(R-r) && rep.x>=centre.x && rep.y<=centre.y){rep=centre+(rep-centre)/sqrt(d2)*(R-r);}
@@ -124,7 +121,7 @@ document.onkeydown=e=>{
 }
 
 
-const particleByteSize= 48 /// pos:vec2f, last:vec2f, col:vec4f
+const particleByteSize= 48 /// ////////////////////:clamping à la fin?...
 const adapter = await navigator.gpu.requestAdapter();
 const device = await adapter.requestDevice();
 
@@ -255,7 +252,8 @@ GlobalsGPU.endPass()
 
 //////////////GRILLE////////////////////////////////////////////////////////////////////////
 let stepNumber=Math.ceil(Math.log2(Ncells))//////////////////VERIFIER
-let p_indices=new Data("array<u32>", "storage", N*4);
+//let p_indices=new Data("array<u32>", "storage", N*4);
+let permute_pos=new Data("array<vec2f>", "storage", N*8,{flags: GPUBufferUsage.COPY_SRC/*debug*/});//stocke les pos permutées selon grille
 
 
 let offsetBuffers = []
@@ -270,8 +268,8 @@ let initGrid=new Action(`//met gridCount à 0,ATTENTION EXECUTE MOINS QUE LES AU
 @compute @workgroup_size(64) fn cs($ID) {gridCount[id.x]=0;}`)
 initGrid.fixBindGroup({gridCount})
 
-let getcell=`fn getcell(p:vec2f) -> i32{//optimisable?
-	return i32((p.x+dim.x/2.0)/cote)+dimGrille.x*i32((p.y+dim.y/2.0)/cote);
+let getcell=`fn getcell(p:vec2f) -> u32{//optimisable?
+	return u32((p.x+dim.x/2.0)/cote)+dimGrille.x*u32((p.y+dim.y/2.0)/cote);
 }`
 
 let countBallsPerCell=new Action(`///remplis gridCount + remplis les localId
@@ -282,7 +280,8 @@ ${getcell}
 	let i=id.x;
 	if(i<N){
 		let cell=getcell(data[i].pos);
-		data[i].id=atomicAdd(&gridCount[cell],1u);
+		let localId=atomicAdd(&gridCount[cell],1u);
+		data[i].id=cell+Ncells*localId;///comme ca, contient toute l'info
 	}
 }`)
 countBallsPerCell.fixBindGroup({data, gridCount});
@@ -310,16 +309,16 @@ let ecrisBalles= new Action(`
 #var<storage, read> gridCount : array<u32>;
 #var<storage, read> data : array<Particle>;
 #var<storage, read> cellIndex : array<u32>;
-#var<storage, read_write> p_indices : array<u32>;/////permutation de tous les indices pour fit les cases
-${getcell}
+#var<storage, read_write> permute_pos : array<vec2f>;/////permutation des pos
 @compute @workgroup_size(64) fn cs($ID) {///render sur cellIndex pour la premiere fois
 	if(id.x<N){
-		let curcell=getcell(data[id.x].pos);
-		let index=data[id.x].id + cellIndex[curcell]-gridCount[curcell];
-		p_indices[index]=id.x;
+		let curId=data[id.x].id;
+		let curcell=curId%Ncells;//recupere cell
+		let index=curId/Ncells + cellIndex[curcell]-gridCount[curcell];
+		permute_pos[index]=data[id.x].pos;
 	}
 }`)
-ecrisBalles.fixBindGroup({gridCount, data, cellIndex:cellIndex[cellIndexRealValue], p_indices})
+ecrisBalles.fixBindGroup({gridCount, data, cellIndex:cellIndex[cellIndexRealValue], permute_pos})
 
 function actugrille(pass){////init, compte, prefix sum
 	initGrid.apply(-1,Math.ceil(Ncells / 64))
@@ -342,12 +341,11 @@ let calcNewPos=new Action(`/////interaction entre particules
 #var<storage, read_write> data : array<Particle>;
 #var<storage, read> gridCount : array<u32>;
 #var<storage, read> cellIndex : array<u32>;
-#var<storage, read> p_indices : array<u32>;
+#var<storage, read> permute_pos : array<vec2f>;
 
 ${collisionsBords}
-${getcell}
-fn considere(pos:vec2f, i:u32, j:u32) -> vec2f{//i : moi	
-	let p=data[j].pos;
+fn considere(pos:vec2f,i:u32, p:vec2f) -> vec2f{// pos :ma pos, p: pos de l'autre
+	
 	let d2=dot(p-pos, p-pos);////OPTIMISABLE
 	if(d2<${4*R*R}){
 		let d=sqrt(d2);
@@ -359,21 +357,34 @@ fn considere(pos:vec2f, i:u32, j:u32) -> vec2f{//i : moi
 }
 fn getnewpos(pos:vec2f, i:u32) -> vec2f {//ITERE+CALCULE COLLISIONS
 	var rep=pos;
-
-	var cell0:u32=(u32(getcell(pos))+ (Ncells-u32(dimGrille.x) - 1u) )%Ncells; //BOTTOM LEFT CELL
-	for(var k:u32 = 0; k< gridCount[cell0]+gridCount[(cell0+1)%Ncells]+gridCount[(cell0+2)%Ncells];k++){
-		let j=p_indices[(cellIndex[cell0]-gridCount[cell0]+k)%N];
-		rep+=considere(pos,i,j);
+	let myCell=data[i].id%Ncells;
+	let myIndex=cellIndex[myCell]-gridCount[myCell]+data[i].id/Ncells;
+	
+	//bottom
+	var cell0:u32=(data[i].id%Ncells+ (Ncells-dimGrille.x - 1u) )%Ncells; //BOTTOM LEFT CELL
+	let inu1=gridCount[cell0]+gridCount[(cell0+1)%Ncells]+gridCount[(cell0+2)%Ncells];
+	for(var k:u32 = 0; k< inu1;k++){
+		let p=permute_pos[(cellIndex[cell0]-gridCount[cell0]+k)%N];
+		rep+=considere(pos,i,p);
 	}
-	cell0=(cell0+u32(dimGrille.x))%Ncells;
-	for(var k:u32 = 0; k< gridCount[cell0]+gridCount[(cell0+1)%Ncells]+gridCount[(cell0+2)%Ncells];k++){
-		let j=p_indices[(cellIndex[cell0]-gridCount[cell0]+k)%N];
-		if(j!=i){rep+=considere(pos,i,j);}
+	////my cellule
+	cell0=(cell0+dimGrille.x)%Ncells;
+	let myK=gridCount[cell0]+data[i].id/Ncells;
+	for(var k:u32 = 0; k< myK;k++){
+		let p=permute_pos[(cellIndex[cell0]-gridCount[cell0]+k)%N];
+		rep+=considere(pos,i,p);
 	}
-	cell0=(cell0+u32(dimGrille.x))%Ncells;
-	for(var k:u32 = 0; k< gridCount[cell0]+gridCount[(cell0+1)%Ncells]+gridCount[(cell0+2)%Ncells];k++){
-		let j=p_indices[(cellIndex[cell0]-gridCount[cell0]+k)%N];
-		rep+=considere(pos,i,j);
+	let inu2=gridCount[cell0]+gridCount[(cell0+1)%Ncells]+gridCount[(cell0+2)%Ncells];
+	for(var k:u32 = myK+1; k< inu2;k++){
+		let p=permute_pos[(cellIndex[cell0]-gridCount[cell0]+k)%N];
+		rep+=considere(pos,i,p);
+	}
+	///top cellule
+	cell0=(cell0+dimGrille.x)%Ncells;
+	let inu3=gridCount[cell0]+gridCount[(cell0+1)%Ncells]+gridCount[(cell0+2)%Ncells];
+	for(var k:u32 = 0; k< inu3;k++){
+		let p=permute_pos[(cellIndex[cell0]-gridCount[cell0]+k)%N];
+		rep+=considere(pos,i,p);
 	}
 	return collisionsBords(rep);
 }
@@ -383,7 +394,7 @@ fn getnewpos(pos:vec2f, i:u32) -> vec2f {//ITERE+CALCULE COLLISIONS
 		data[i].newpos=getnewpos(data[i].pos,i);
 	}
 }`);
-calcNewPos.fixBindGroup({data, gridCount, cellIndex : cellIndex[cellIndexRealValue], p_indices});
+calcNewPos.fixBindGroup({data, gridCount, cellIndex : cellIndex[cellIndexRealValue], permute_pos});
 
 let exchangePosAndNewPos=new Action(`/////interaction entre particules
 #var<storage, read_write> data : array<Particle>;
@@ -391,7 +402,7 @@ let exchangePosAndNewPos=new Action(`/////interaction entre particules
 ${collisionsBords}
 fn getForce(pos:vec2f) -> vec2f{
 	let d2=dot(pos-obst.pos,pos-obst.pos);
-	return vec2f(0,-g)+select(vec2f(0),vec2f(2.2,0.2),pos.y<-300 && pos.x<100.0 && pos.x>-dim.x/2.0+100) + select(vec2f(0.0,0.0),(pos-obst.pos)/(d2+100.0)*2000.0,d2<100*100);
+	return vec2f(0,-g)+select(vec2f(0),vec2f(1.7,0.2),pos.y<-300 && pos.x<100.0 && pos.x>-dim.x/2.0+100) + select(vec2f(0.0,0.0),(pos-obst.pos)/(d2+100.0)*2000.0,d2<100*100);
 }
 @compute @workgroup_size(64) fn cs($ID){
 	let i=id.x;
@@ -438,7 +449,6 @@ fpsc++
 	}
 
 	device.queue.submit([commandEncoder.finish()]);
-
 	if(!go) return
 	time++;
 	window.requestAnimationFrame(main)
@@ -462,7 +472,7 @@ document.addEventListener("mousemove", (e)=>{
 	let y = e.clientY - r.top;
 	updateObst(x-W/2,H/2-y);
 }); 
-//todo : add cell dans Particle
+//todo : hilbert curves cache opti
 </script>
 </body>
 </html>
