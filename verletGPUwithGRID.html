@@ -357,8 +357,8 @@ fn considere(pos:vec2f,i:u32, p:vec2f) -> vec2f{// pos :ma pos, p: pos de l'autr
 }
 fn getnewpos(pos:vec2f, i:u32) -> vec2f {//ITERE+CALCULE COLLISIONS
 	var rep=pos;
-	let myCell=data[i].id%Ncells;
-	let myIndex=cellIndex[myCell]-gridCount[myCell]+data[i].id/Ncells;
+	//let myCell=data[i].id%Ncells;
+	//let myIndex=cellIndex[myCell]-gridCount[myCell]+data[i].id/Ncells;
 	
 	//bottom
 	var cell0:u32=(data[i].id%Ncells+ (Ncells-dimGrille.x - 1u) )%Ncells; //BOTTOM LEFT CELL
@@ -369,15 +369,10 @@ fn getnewpos(pos:vec2f, i:u32) -> vec2f {//ITERE+CALCULE COLLISIONS
 	}
 	////my cellule
 	cell0=(cell0+dimGrille.x)%Ncells;
-	let myK=gridCount[cell0]+data[i].id/Ncells;
-	for(var k:u32 = 0; k< myK;k++){
-		let p=permute_pos[(cellIndex[cell0]-gridCount[cell0]+k)%N];
-		rep+=considere(pos,i,p);
-	}
 	let inu2=gridCount[cell0]+gridCount[(cell0+1)%Ncells]+gridCount[(cell0+2)%Ncells];
-	for(var k:u32 = myK+1; k< inu2;k++){
+ 	for(var k:u32 = 0; k< inu2;k++){
 		let p=permute_pos[(cellIndex[cell0]-gridCount[cell0]+k)%N];
-		rep+=considere(pos,i,p);
+		if(p.x!=pos.x || p.y!=pos.y){rep+=considere(pos,i,p);}
 	}
 	///top cellule
 	cell0=(cell0+dimGrille.x)%Ncells;
